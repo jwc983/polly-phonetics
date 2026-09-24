@@ -1,0 +1,88 @@
+<!doctype html>
+<!-- Automated smoke test: open with headless Chrome (see tests/run-smoke.sh).
+     Plays whole sessions by tapping every choice, and prints a JSON report into #report. -->
+<html><head><meta charset="utf-8"><title>smoke</title></head>
+<body>
+<iframe id="app" src="../index.html" style="width:900px;height:800px"></iframe>
+<pre id="report">pending</pre>
+<script>
+const errors = [];
+const spoken = [];
+const seen = new Set();
+const frame = document.getElementById("app");
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const loaded = () => new Promise((r) => frame.addEventListener("load", r, { once: true }));
+
+// Fresh handles to the app window, with fast fake speech so the test does not depend on voices.
+function hook() {
+  const w = frame.contentWindow;
+  w.addEventListener("error", (e) => errors.push(String(e.message)));
+  const origErr = w.console.error.bind(w.console);
+  w.console.error = (...a) => { errors.push(a.map(String).join(" ")); origErr(...a); };
+  w.speechSynthesis.speak = (u) => { spoken.push(u.text); setTimeout(() => u.onend && u.onend(), 5); };
+  w.speechSynthesis.cancel = () => {};
+  return { w, d: frame.contentDocument };
+}
+
+async function playSession() {
+  const { d } = hook();
+  d.getElementById("startBtn").click();
+  for (let tick = 0; tick < 600; tick++) {
+    await sleep(150);
+    if (!d.getElementById("home").hidden) return "home";
+    const stage = d.getElementById("stage");
+    [...stage.querySelectorAll("button")].forEach((b) => { seen.add(b.className.split(" ")[0] || b.textContent); if (b.getAttribute("aria-label") === "Robot") seen.add("robot-game"); });
+    const next = stage.querySelector("button.next");
+    if (next) { next.click(); continue; }
+    const judge = stage.querySelector(".judge button");
+    if (judge) { stage.querySelector(".blend-btn").click(); await sleep(100); judge.click(); continue; }
+    const choices = [...stage.querySelectorAll("button.choice:not(.faded):not(.right)")];
+    if (choices.length) choices[tick % choices.length].click();
+  }
+  return "timeout";
+}
+
+(async () => {
+  await loaded();
+  frame.contentWindow.localStorage.clear();
+  const results = [];
+  for (const introduced of [1, 6, 12]) {
+    const w = frame.contentWindow;
+    const st = JSON.parse(w.localStorage.getItem("polly-phonics-v1") || "null") || { version: 1 };
+    st.introduced = introduced;
+    w.localStorage.setItem("polly-phonics-v1", JSON.stringify(st));
+    w.location.reload();
+    await loaded();
+    await sleep(2000); // let the app finish looking for sound files
+    results.push({ introduced, end: await playSession() });
+  }
+  const { w, d } = hook();
+  w.openParent();
+  await sleep(100);
+  const panelText = d.getElementById("panel").textContent;
+  // A recorded word must play instead of the computer voice.
+  const played = [];
+  const RealAudio = w.Audio;
+  w.Audio = function (src) { const a = new RealAudio(src); played.push(src); return a; };
+  w.eval(`recordings["w:sun"] = URL.createObjectURL(encodeWav(new Float32Array(4000).fill(0.2), 22050, 0.2));
+          recordings["p:rhymes"] = recordings["w:sun"];`);
+  const spokenBefore = spoken.length;
+  await w.eval(`sayWord("sun")`);
+  await w.eval(`sayWord("moon")`);
+  await w.eval(`sayPhraseThen("rhymes", "cat", () => {})`);
+  w.Audio = RealAudio;
+  const wordRecording = {
+    items: w.eval(`recordableWords().length + Object.keys(PHRASES).length`),
+    playedRecordings: played.filter((u) => String(u).startsWith("blob:")).length,
+    computerSaid: spoken.slice(spokenBefore)
+  };
+  const state = JSON.parse(w.localStorage.getItem("polly-phonics-v1"));
+  document.getElementById("report").textContent = "REPORT " + JSON.stringify({
+    results, errors, seen: [...seen], stickers: state.stickers,
+    lettersTried: Object.keys(state.stats).join(""), words: Object.keys(state.words).length,
+    panelOk: panelText.includes("Grown-up menu") && panelText.includes("Record the letter sounds") && panelText.includes("Record words and phrases"), wordRecording, wordChips: d.querySelectorAll(".wchip").length,
+    recRows: d.querySelectorAll(".rec").length, spokenCount: spoken.length, robot: spoken.includes("Robot says"), robotReady: w.eval("robotReady().length"), turn: state.warmupTurn, seenRobot: seen.has("robot-game"), spokenSample: spoken.slice(0, 15)
+  });
+})();
+</script>
+</body></html>
