@@ -101,15 +101,21 @@
 
   .hero-letter { font-family: var(--letter-font); font-size: 13rem; line-height: 1; border: 0; background: none; padding: 0 20px; }
   .hero-pic { font-size: 7rem; line-height: 1; border: 0; background: none; }
-  .with-letter { display: flex; align-items: center; gap: 18px; }
+  .with-letter { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 18px; }
   .with-letter .tag { font-family: var(--letter-font); font-size: 4.5rem; line-height: 1; }
 
-  .tiles { display: flex; gap: 12px; }
+  /* Tiles are sized in em, and the row's font shrinks when a long word would not fit.
+     --w is the row's width in em, set by app.js. */
+  .tiles {
+    display: flex; gap: 0.125em; font-family: var(--letter-font); line-height: 1;
+    font-size: min(6rem, calc((min(100vw, 820px) - 48px) / var(--w, 4)));
+  }
   .tile {
-    font-family: var(--letter-font); font-size: 6rem; line-height: 1; width: 120px; height: 140px;
+    width: 1.25em; height: 1.46em; padding: 0;
     border-radius: 22px; border: 4px solid var(--line); background: var(--card); box-shadow: var(--shadow);
     display: grid; place-items: center;
   }
+  .tile.wide { width: auto; padding: 0 0.15em; }
   .tile.lit { border-color: var(--accent); background: var(--soft); }
   .blend-btn { font-size: 2.4rem; padding: 10px 30px; border-radius: 999px; border: 0; background: var(--blend); color: #fff; box-shadow: var(--shadow); }
   .reveal { font-size: 6rem; min-height: 7rem; line-height: 1; }
@@ -153,8 +159,10 @@
   .suggest { background: var(--soft); border-radius: 10px; padding: 10px 12px; margin: 10px 0; font-size: 0.92rem; }
   .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
   .rec-list { display: grid; gap: 8px; }
+  .rec-list.later { margin-top: 8px; }
   .rec { display: grid; grid-template-columns: 56px 1fr auto; gap: 10px; align-items: center; border: 1px solid var(--line); border-radius: 12px; padding: 8px 10px; }
   .rec .ph { font-family: var(--letter-font); font-size: 2rem; text-align: center; }
+  .rec .ph.multi { font-size: 1.3rem; line-height: 1.2; }
   .rec .tips { font-size: 0.82rem; line-height: 1.35; }
   .rec .status { font-size: 0.75rem; font-weight: 600; }
   .rec .status.ok { color: var(--good); }
@@ -177,9 +185,13 @@
     .choice.letter { font-size: 5rem; }
     .choice.pic { font-size: 4.2rem; }
     .hero-letter { font-size: 9rem; }
-    .tile { width: 84px; height: 104px; font-size: 4.2rem; }
+    .tiles { font-size: min(4.2rem, calc((100vw - 48px) / var(--w, 4))); }
+    .tile { border-radius: 16px; }
     .rec { grid-template-columns: 40px 1fr; }
     .rec .btns { grid-column: 1 / -1; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }
   }
 </style>
 </head>
@@ -205,7 +217,7 @@
 <!-- Grown-up menu: opened by holding the gear for about a second. -->
 <button id="gearBtn" class="gear" aria-label="Grown-up menu (hold)"><span class="ring"></span>⚙️</button>
 <div id="parent" hidden>
-  <div class="panel" id="panel"></div>
+  <div class="panel" id="panel" role="dialog" aria-modal="true" aria-label="Grown-up menu"></div>
 </div>
 <div id="audioNote" class="missing-audio" hidden></div>
 

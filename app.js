@@ -4,7 +4,8 @@
 
 const C = window.CURRICULUM;
 const LETTERS = C.letters;
-const VOWELS = new Set(["a", "i", "o"]);
+// Letters are keyed by `id`: the letter itself, unless two letters look the same (oo in "moon" and "book").
+LETTERS.forEach((l) => { l.id = l.id || l.g; });
 const STORE_KEY = "polly-phonics-v1";
 
 // ---------- small helpers ----------
@@ -36,7 +37,27 @@ function today() {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
-const letterOf = (g) => LETTERS.find((l) => l.g === g);
+const letterOf = (id) => LETTERS.find((l) => l.id === id);
+// The name a grown-up sees: "oo" alone would not say which oo, so it becomes "oo (book)".
+const labelOf = (l) => (LETTERS.some((o) => o !== l && o.g === l.g) ? `${l.g} (${l.keyword})` : l.g);
+// Split a word into its letters, longest first, so "duck" is d-u-ck and "night" is n-igh-t.
+// A word can list its own `units` when the spelling is not enough ("book" uses the short oo).
+const GRAPHEMES = [...new Set(LETTERS.map((l) => l.g))].sort((a, b) => b.length - a.length);
+function lettersOf(w) {
+  if (w.units) return w.units.map(letterOf);
+  const out = [];
+  for (let i = 0; i < w.word.length;) {
+    const g = GRAPHEMES.find((x) => w.word.startsWith(x, i)) || w.word[i];
+    out.push(letterOf(g));
+    i += g.length;
+  }
+  return out;
+}
+// Two first sounds too alike for a young child to tell apart: two vowels, or a listed pair (f and th).
+function tooClose(a, b) {
+  if (C.phonemes[a] && C.phonemes[a].vowel && C.phonemes[b] && C.phonemes[b].vowel) return true;
+  return C.similar.some((group) => group.includes(a) && group.includes(b));
+}
 // replaceChildren() would print a null child as the text "null", so drop empties first.
 function setKids(node, ...kids) { node.replaceChildren(...kids.filter((k) => k != null)); }
 
@@ -45,13 +66,31 @@ function setKids(node, ...kids) { node.replaceChildren(...kids.filter((k) => k !
 function defaultState() {
   return { version: 1, introduced: 1, stats: {}, words: {}, stickers: 0, sessions: [], warmupTurn: 0, settings: { rounds: 6, voice: "girl", raiseMyPitch: false } };
 }
+function normalizeState(value) {
+  if (!value || value.version !== 1 || typeof value !== "object" || Array.isArray(value)) return defaultState();
+  const clean = defaultState();
+  const attempts = (groups, limit) => {
+    if (!groups || typeof groups !== "object" || Array.isArray(groups)) return {};
+    return Object.fromEntries(Object.entries(groups).flatMap(([key, list]) => {
+      if (!Array.isArray(list)) return [];
+      return [[key, list.filter((a) => a && typeof a === "object" && typeof a.d === "string" && typeof a.ok === "boolean").slice(-limit)]];
+    }));
+  };
+  clean.introduced = Math.min(LETTERS.length, Math.max(1, Number.isInteger(value.introduced) ? value.introduced : 1));
+  clean.stats = attempts(value.stats, 40);
+  clean.words = attempts(value.words, 20);
+  clean.stickers = Number.isInteger(value.stickers) && value.stickers >= 0 ? value.stickers : 0;
+  clean.sessions = Array.isArray(value.sessions) ? value.sessions.filter((d) => typeof d === "string").slice(-200) : [];
+  clean.warmupTurn = Number.isInteger(value.warmupTurn) && value.warmupTurn >= 0 ? value.warmupTurn : 0;
+  if ([4, 6, 8].includes(value.settings && value.settings.rounds)) clean.settings.rounds = value.settings.rounds;
+  if (["girl", "adult"].includes(value.settings && value.settings.voice)) clean.settings.voice = value.settings.voice;
+  clean.settings.raiseMyPitch = !!(value.settings && value.settings.raiseMyPitch);
+  return clean;
+}
 function loadState() {
   try {
     const raw = localStorage.getItem(STORE_KEY);
-    if (raw) {
-      const s = JSON.parse(raw);
-      if (s && s.version === 1) return Object.assign(defaultState(), s, { settings: Object.assign(defaultState().settings, s.settings) });
-    }
+    if (raw) return normalizeState(JSON.parse(raw));
   } catch (e) { /* storage blocked or corrupt: start fresh */ }
   return defaultState();
 }
@@ -83,8 +122,8 @@ function letterStatus(g) {
 const introducedLetters = () => LETTERS.slice(0, state.introduced);
 const focusLetter = () => LETTERS[state.introduced - 1];
 function readableWords() {
-  const known = new Set(introducedLetters().map((l) => l.g));
-  return C.readWords.filter((w) => [...w.word].every((ch) => known.has(ch)));
+  const known = new Set(introducedLetters());
+  return C.readWords.filter((w) => lettersOf(w).every((l) => known.has(l)));
 }
 
 // ---------- sound effects (generated, no files needed) ----------
@@ -119,22 +158,29 @@ const drum = () => tone(160, 0, 0.25, "sine", 0.6, 60);
 
 // ---------- speech (whole words only; never isolated letter sounds) ----------
 
-// Voice styles. No system voice is a real child, so "girl" uses a clear female
-// voice with raised pitch, which sounds like a young girl.
+// Keep synthetic speech close to a natural speaking voice. Large pitch shifts make
+// even good system voices sound robotic, so the child-friendly option is only
+// slightly brighter and uses the best locally installed female voice available.
 const VOICE_STYLES = {
-  girl: { names: /Samantha|Flo|Shelley|Sandy|Ava|Allison|Susan|Zoe|Karen/, pitch: 1.6, rate: 1.05 },
+  girl: { names: /Samantha|Flo|Shelley|Sandy|Ava|Allison|Susan|Zoe|Karen/, pitch: 1.08, rate: 1.08 },
   adult: { names: /Samantha|Ava|Allison|Susan|Zoe/, pitch: 1, rate: 1 }
 };
 const voiceStyle = () => VOICE_STYLES[state.settings.voice] || VOICE_STYLES.girl;
 let voice = null;
+let currentSpeechFinish = null;
 function pickVoice() {
   if (!("speechSynthesis" in window)) return;
   const vs = speechSynthesis.getVoices();
   const us = vs.filter((v) => v.lang === "en-US" || v.lang === "en_US");
   const style = voiceStyle();
-  // Novelty voices (Grandma, Bubbles…) and male voices are skipped by the name list.
-  voice = us.find((v) => v.localService && style.names.test(v.name) && !/Grandma|Grandpa/.test(v.name))
-    || us.find((v) => v.localService) || us[0] || vs.find((v) => /^en/.test(v.lang)) || null;
+  // Prefer downloaded Premium/Enhanced voices. Novelty voices are deliberately
+  // penalized; a familiar high-quality voice matters more than artificial pitch.
+  const score = (v) => (v.localService ? 20 : 0)
+    + (/Premium/i.test(v.name) ? 12 : /Enhanced/i.test(v.name) ? 8 : 0)
+    + (style.names.test(v.name) ? 6 : 0)
+    - (/Grandma|Grandpa|Bubbles|Organ|Trinoids|Whisper/i.test(v.name) ? 50 : 0);
+  const candidates = us.length ? us : vs.filter((v) => /^en(?:-|_)/i.test(v.lang));
+  voice = candidates.slice().sort((a, b) => score(b) - score(a))[0] || null;
 }
 if ("speechSynthesis" in window) {
   pickVoice();
@@ -143,7 +189,7 @@ if ("speechSynthesis" in window) {
 function say(text, rate = 0.85) {
   return new Promise((resolve) => {
     if (!("speechSynthesis" in window)) return resolve();
-    speechSynthesis.cancel();
+    stopAudio();
     const u = new SpeechSynthesisUtterance(text);
     u.lang = "en-US";
     if (voice) u.voice = voice;
@@ -152,7 +198,14 @@ function say(text, rate = 0.85) {
     let finished = false;
     // Some browsers never fire onend, so a timer resolves as a fallback.
     const timer = setTimeout(() => finish(), 1500 + (text.length * 110) / rate);
-    function finish() { if (!finished) { finished = true; clearTimeout(timer); resolve(); } }
+    function finish() {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      if (currentSpeechFinish === finish) currentSpeechFinish = null;
+      resolve();
+    }
+    currentSpeechFinish = finish;
     u.onend = finish;
     u.onerror = finish;
     speechSynthesis.speak(u);
@@ -167,7 +220,13 @@ let currentAudio = null;
 
 function stopAudio() {
   if ("speechSynthesis" in window) speechSynthesis.cancel();
-  if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+  if (currentSpeechFinish) currentSpeechFinish();
+  if (currentAudio) {
+    const playback = currentAudio;
+    currentAudio = null;
+    playback.audio.pause();
+    playback.finish();
+  }
 }
 function soundUrl(ph) { return recordings[ph] || fileSounds[ph] || null; }
 const hasSound = (ph) => !!soundUrl(ph);
@@ -193,14 +252,23 @@ async function findSoundFiles() {
 
 function playUrl(url) {
   return new Promise((resolve) => {
+    stopAudio();
     const a = new Audio(url);
     // Recordings play in the grown-up's natural voice unless they choose to raise the pitch.
     if (state.settings.raiseMyPitch) {
       a.preservesPitch = a.mozPreservesPitch = a.webkitPreservesPitch = false;
       a.playbackRate = 1.2;
     }
-    currentAudio = a;
-    const done = () => { clearTimeout(t); resolve(); };
+    let finished = false;
+    const playback = { audio: a, finish: done };
+    currentAudio = playback;
+    function done() {
+      if (finished) return;
+      finished = true;
+      clearTimeout(t);
+      if (currentAudio === playback) currentAudio = null;
+      resolve();
+    }
     const t = setTimeout(done, 6000);
     a.onended = done;
     a.onerror = done;
@@ -424,14 +492,15 @@ function buildPlan() {
   for (let i = 0; i < state.settings.rounds; i++) {
     const target = pickTarget(last);
     last = target;
-    steps.push({ type: i % 2 === 0 ? "findLetter" : "findSound", letter: target });
+    // Letters with no "starts with" pictures (ck, ng, ai…) only get "hear the sound, tap the letter" rounds.
+    steps.push({ type: i % 2 === 0 || target.noPictures ? "findLetter" : "findSound", letter: target });
   }
   const words = readableWords();
   if (words.length) {
     const tries = (w) => (state.words[w.word] || []).length;
-    const newest = focusLetter().g;
-    const ranked = shuffle(words).sort((a, b) =>
-      (tries(a) - (a.word.includes(newest) ? 2 : 0)) - (tries(b) - (b.word.includes(newest) ? 2 : 0)));
+    const newest = focusLetter();
+    const rank = (w) => tries(w) - (lettersOf(w).includes(newest) ? 2 : 0);
+    const ranked = shuffle(words).sort((a, b) => rank(a) - rank(b));
     ranked.slice(0, 2).forEach((w) => steps.push({ type: "read", word: w }));
   }
   steps.push({ type: "done" });
@@ -445,7 +514,7 @@ function pickTarget(last) {
   if (last !== focus && Math.random() < 0.5) return focus;
   const pool = known.filter((l) => l !== last);
   const weights = pool.map((l) => {
-    const s = letterStatus(l.g);
+    const s = letterStatus(l.id);
     return 1.3 - (s.tries ? s.correct / s.tries : 0.5);
   });
   let r = Math.random() * weights.reduce((a, b) => a + b, 0);
@@ -493,7 +562,7 @@ const STEPS = {
     const ph = letter.phoneme;
     const letterBtn = el("button", { class: "hero-letter", text: letter.g, "aria-label": `Letter ${letter.g}`, onclick: () => { stopPrompt(); playPhoneme(ph); } });
     const picBtn = el("button", { class: "hero-pic", text: letter.emoji, "aria-label": letter.keyword, onclick: () => { stopPrompt(); sayWord(letter.keyword); } });
-    // c and k make the same sound: show them together once both are taught.
+    // Letters with the same sound (c, k and ck; f and ff) are shown together once they are taught.
     const twins = introducedLetters().filter((l) => l.phoneme === ph && l !== letter);
     const twinRow = twins.length
       ? el("div", { class: "row" }, [...twins, letter].map((l) => el("button", { class: "choice letter", text: l.g, onclick: () => { stopPrompt(); playPhoneme(ph); } })))
@@ -522,9 +591,11 @@ const STEPS = {
   async findLetter({ letter }, id) {
     const known = introducedLetters();
     const count = known.length <= 2 ? 2 : 3;
-    const differs = (l) => l.phoneme !== letter.phoneme;
+    // A wrong answer must sound different and look different (the two oo letters look the same).
+    const differs = (l) => l.phoneme !== letter.phoneme && l.g !== letter.g;
     let distractors = shuffle(known.filter(differs));
     if (distractors.length < count - 1) distractors = distractors.concat(LETTERS.slice(state.introduced).filter(differs));
+    distractors = distractors.filter((l, i, all) => all.findIndex((o) => o.g === l.g) === i);
     const options = shuffle([letter, ...distractors.slice(0, count - 1)]);
     const buttons = options.map((l) => el("button", { class: "choice letter", text: l.g, "aria-label": `Letter ${l.g}` }));
     const speaker = el("button", { class: "speaker", text: "🔊", "aria-label": "Hear the sound" });
@@ -540,7 +611,7 @@ const STEPS = {
     replay();
     const firstTry = await answer;
     guard(id);
-    recordAttempt(letter.g, firstTry, "letter");
+    recordAttempt(letter.id, firstTry, "letter");
     await sleep(900);
     guard(id);
   },
@@ -554,8 +625,7 @@ const STEPS = {
     // With no recording the fallback says the keyword, which would give the answer away.
     if (!hasSound(ph) && targets.length > 1) targets = targets.filter((p) => p.word !== C.phonemes[ph].keyword);
     const target = pick(targets);
-    // For a vowel, other vowel pictures are too close to tell apart at this age.
-    const pool = C.pictures.filter((p) => p.first !== ph && !(VOWELS.has(ph) && VOWELS.has(p.first)));
+    const pool = C.pictures.filter((p) => p.first !== ph && !tooClose(ph, p.first));
     const options = shuffle([target, ...shuffle(pool).slice(0, count - 1)]);
     const buttons = options.map((p) => el("button", { class: "choice pic", text: p.emoji, "aria-label": p.word }));
     const speaker = el("button", { class: "speaker", text: "🔊", "aria-label": "Hear the sound" });
@@ -582,7 +652,7 @@ const STEPS = {
     replay();
     const firstTry = await answer;
     guard(id);
-    recordAttempt(letter.g, firstTry, "sound");
+    recordAttempt(letter.id, firstTry, "sound");
     await sayWord(target.word);
     guard(id);
     await sleep(400);
@@ -592,8 +662,8 @@ const STEPS = {
   // Read a word: tap each letter for its sound, blend, then the grown-up marks it.
   // The picture appears only after the attempt, so the child reads rather than guesses.
   async read({ word }, id) {
-    const letters = [...word.word].map(letterOf);
-    const tiles = letters.map((l) => el("button", { class: "tile", text: l.g, "aria-label": `Letter ${l.g}` }));
+    const letters = lettersOf(word);
+    const tiles = letters.map((l) => el("button", { class: l.g.length > 1 ? "tile wide" : "tile", text: l.g, "aria-label": `Letter ${l.g}` }));
     tiles.forEach((t, i) => t.addEventListener("click", () => startPrompt(id, async (check) => {
       t.classList.add("lit");
       try { await playPhoneme(letters[i].phoneme); check(); } finally { t.classList.remove("lit"); }
@@ -617,7 +687,9 @@ const STEPS = {
       el("button", { text: "🤝", "aria-label": "Needed help", onclick: () => judged(false) })
     ]);
     const hint = el("div", { class: "parent-hint", text: "Grown-up: ✓ read it alone · 🤝 needed help — 家长：自己读出来点 ✓，需要帮助点 🤝" });
-    setKids(stage(), el("div", { class: "tiles" }, tiles), blendBtn, reveal, judgeRow, hint, slot);
+    // Rough width of the row in letter-heights, so long words shrink to fit a phone (see .tiles).
+    const width = letters.reduce((sum, l) => sum + (l.g.length > 1 ? 0.6 * l.g.length + 0.4 : 1.25), 0) + 0.125 * (letters.length - 1);
+    setKids(stage(), el("div", { class: "tiles", style: `--w: ${width.toFixed(2)}` }, tiles), blendBtn, reveal, judgeRow, hint, slot);
     const ok = await judge;
     guard(id);
     stopPrompt();
@@ -813,11 +885,14 @@ let recordTimer = null;
 let micStream = null; // kept open while the menu is open, so the browser asks only once
 let resetArmed = false;
 let panelMessage = "";
+let showLaterSounds = false;
+let showAllLetters = false;
 
 function openParent() {
   stopAudio();
   $("parent").hidden = false;
   renderParent();
+  $("panel").querySelector("button")?.focus();
 }
 function closeParent() {
   if (recorder) stopRecording();
@@ -825,9 +900,11 @@ function closeParent() {
   $("parent").hidden = true;
   resetArmed = false;
   panelMessage = "";
+  showAllLetters = false;
   goHome();
 }
 $("parent").addEventListener("click", (e) => { if (e.target === $("parent")) closeParent(); });
+$("parent").addEventListener("keydown", (e) => { if (e.key === "Escape") closeParent(); });
 
 function bi(en, zh) {
   return [en, el("span", { class: "zh", text: ` · ${zh}` })];
@@ -836,11 +913,11 @@ function bi(en, zh) {
 function renderParent() {
   const panel = $("panel");
   const focus = focusLetter();
-  const fs = letterStatus(focus.g);
+  const fs = letterStatus(focus.id);
   const next = LETTERS[state.introduced];
 
   const chips = LETTERS.map((l, i) => {
-    const s = letterStatus(l.g);
+    const s = letterStatus(l.id);
     const taught = i < state.introduced;
     let label = "not yet · 未学";
     if (taught) label = s.tries === 0 ? "new · 新" : s.ready ? "ready ✓ · 已掌握" : `${s.correct}/${s.tries} · 练习中`;
@@ -848,34 +925,42 @@ function renderParent() {
     return el("button", {
       class: cls, title: "Make this the current letter · 设为当前字母",
       onclick: () => { state.introduced = i + 1; saveState(); panelMessage = ""; renderParent(); }
-    }, [el("b", { text: l.g }), label]);
+    }, [el("b", { text: l.g }), labelOf(l) === l.g ? null : `${l.keyword} · `, label]);
   });
+  // Keep the phone menu useful: show the current learning neighborhood first,
+  // while retaining an explicit way to jump to any later letter.
+  const nearbyCount = Math.min(LETTERS.length, Math.max(12, state.introduced + 4));
+  const nearbyChips = chips.slice(0, nearbyCount);
+  const laterChips = chips.slice(nearbyCount);
 
+  const focusName = labelOf(focus);
   let suggestion;
   if (fs.ready && next) {
-    suggestion = bi(`“${focus.g}” looks secure (${fs.correct} of the last ${fs.tries} right, on ${fs.days} days). When your child seems keen, you could teach the next letter, “${next.g}”.`,
-      `“${focus.g}” 已经比较熟练。孩子有兴趣时，可以开始教下一个字母 “${next.g}”。`);
+    suggestion = bi(`“${focusName}” looks secure (${fs.correct} of the last ${fs.tries} right, on ${fs.days} days). When your child seems keen, you could teach the next letter, “${labelOf(next)}”.`,
+      `“${focusName}” 已经比较熟练。孩子有兴趣时，可以开始教下一个字母 “${labelOf(next)}”。`);
   } else if (fs.ready) {
-    suggestion = bi("All 12 letters are taught. Keep reading short words for fun; more letters will come in a later version.",
-      "12 个字母都学完了。继续开心地读小单词吧，之后的版本会加入更多字母。");
+    suggestion = bi(`All ${LETTERS.length} letters are taught. Keep reading words and stories together for fun.`,
+      `${LETTERS.length} 个字母都学完了。继续一起开心地读单词和故事吧。`);
   } else if (fs.tries < 5) {
-    suggestion = bi(`Keep practising “${focus.g}” in short sessions on different days. Earlier letters keep coming back for review.`,
-      `在不同的日子里短时间练习 “${focus.g}”。之前学过的字母会自动复习。`);
+    suggestion = bi(`Keep practising “${focusName}” in short sessions on different days. Earlier letters keep coming back for review.`,
+      `在不同的日子里短时间练习 “${focusName}”。之前学过的字母会自动复习。`);
   } else {
-    suggestion = bi(`“${focus.g}” is still settling (${fs.correct} of the last ${fs.tries} right). Keep going, or move on if your child is bored — nothing is locked.`,
-      `“${focus.g}” 还在巩固中（最近 ${fs.tries} 次对了 ${fs.correct} 次）。可以继续练习；如果孩子觉得无聊，也可以前进，没有任何锁定。`);
+    suggestion = bi(`“${focusName}” is still settling (${fs.correct} of the last ${fs.tries} right). Keep going, or move on if your child is bored — nothing is locked.`,
+      `“${focusName}” 还在巩固中（最近 ${fs.tries} 次对了 ${fs.correct} 次）。可以继续练习；如果孩子觉得无聊，也可以前进，没有任何锁定。`);
   }
 
   const words = readableWords().map((w) => w.word);
 
-  const recRows = Object.entries(C.phonemes).map(([ph, info]) => {
-    const graphemes = LETTERS.filter((l) => l.phoneme === ph).map((l) => l.g).join(" / ");
+  // Sounds for the letters taught so far and the next one come first; the rest are tucked away.
+  const soon = new Set(LETTERS.slice(0, state.introduced + 1).map((l) => l.phoneme));
+  const recRow = ([ph, info]) => {
+    const graphemes = LETTERS.filter((l) => l.phoneme === ph).map((l) => l.g);
     const status = recordings[ph] ? ["Recorded ✓ · 已录制", "ok"]
       : fileSounds[ph] ? ["From file ✓ · 使用音频文件", "ok"]
       : ["Missing · 未录制", "missing"];
     const isRec = recordingKey === ph;
     return el("div", { class: "rec" }, [
-      el("div", { class: "ph", text: graphemes }),
+      el("div", { class: graphemes.length > 1 ? "ph multi" : "ph", text: graphemes.join(" ") }),
       el("div", { class: "tips" }, [
         el("div", { class: `status ${status[1]}`, text: status[0] }),
         el("div", { text: `As in “${info.keyword}”. ${info.tip}` }),
@@ -887,7 +972,9 @@ function renderParent() {
         recordings[ph] ? el("button", { class: "pbtn danger", text: "✕", "aria-label": "Delete recording", onclick: async () => { await deleteRecording(ph); renderParent(); } }) : null
       ])
     ]);
-  });
+  };
+  const recRows = Object.entries(C.phonemes).filter(([ph]) => soon.has(ph)).map(recRow);
+  const laterSounds = Object.entries(C.phonemes).filter(([ph]) => !soon.has(ph));
 
   const allWords = recordableWords();
   const phraseItems = Object.entries(PHRASES).map(([k, text]) => ({ key: phraseKey(k), label: text, emoji: "💬", maxMs: 4000 }));
@@ -928,7 +1015,7 @@ function renderParent() {
     [4, 6, 8].map((n) => { const o = el("option", { value: n, text: `${n}` }); if (n === state.settings.rounds) o.selected = true; return o; }));
 
   const voiceSelect = el("select", { class: "pbtn", onchange: (e) => { state.settings.voice = e.target.value; saveState(); pickVoice(); renderParent(); } },
-    [["girl", "Little girl · 小女孩"], ["adult", "Grown-up · 成人"]].map(([v, label]) => {
+    [["girl", "Natural female · 自然女声"], ["adult", "Grown-up · 成人"]].map(([v, label]) => {
       const o = el("option", { value: v, text: label });
       if (v === state.settings.voice) o.selected = true;
       return o;
@@ -944,10 +1031,14 @@ function renderParent() {
     panelMessage ? el("div", { class: "suggest", text: panelMessage }) : null,
 
     el("h3", {}, bi("Progress", "学习进度")),
-    el("div", { class: "letter-grid" }, chips),
+    el("div", { class: "letter-grid" }, showAllLetters ? chips : nearbyChips),
+    laterChips.length ? el("div", { class: "actions" }, [
+      el("button", { class: "pbtn", text: showAllLetters ? "Show fewer letters · 收起之后的字母" : `Show all ${LETTERS.length} letters · 显示全部 ${LETTERS.length} 个字母`,
+        onclick: () => { showAllLetters = !showAllLetters; renderParent(); } })
+    ]) : null,
     el("div", { class: "suggest" }, suggestion),
     el("div", { class: "actions" }, [
-      el("button", { class: "pbtn primary", disabled: next ? null : "", text: next ? `Teach next letter: ${next.g} · 教下一个字母` : "All letters taught · 全部学完",
+      el("button", { class: "pbtn primary", disabled: next ? null : "", text: next ? `Teach next letter: ${labelOf(next)} · 教下一个字母` : "All letters taught · 全部学完",
         onclick: () => { if (next) { state.introduced++; saveState(); renderParent(); } } }),
       el("button", { class: "pbtn", disabled: state.introduced > 1 ? null : "", text: "Go back one · 退回一个",
         onclick: () => { if (state.introduced > 1) { state.introduced--; saveState(); renderParent(); } } })
@@ -960,8 +1051,14 @@ function renderParent() {
     el("h3", {}, bi("Record the letter sounds", "录制字母发音")),
     el("p", {}, bi("Record each sound in your own voice, short and pure. Computer voices add “uh” (s → “suh”), which makes blending “s-a-t” into “sat” much harder. Recording stops by itself after 2.5 seconds; silence at the ends is trimmed.",
       "请用自己的声音录下每个发音，要短而纯。电脑语音会加上 “uh”（s 会变成 “suh”），这会让孩子很难把 s-a-t 拼成 sat。录音 2.5 秒后自动停止，前后的静音会被自动剪掉。")),
-    el("p", { class: "word-list", text: "Or put files named s.m4a, a.m4a, … k.m4a in the audio/sounds folder · 也可以把 s.m4a 等音频文件放进 audio/sounds 文件夹" }),
+    el("p", { class: "word-list", text: "Or put files named after each sound (s.m4a, a.m4a, … ch.m4a; the oo in “book” is oo2.m4a) in the audio/sounds folder · 也可以把以发音命名的音频文件（s.m4a、ch.m4a 等）放进 audio/sounds 文件夹" }),
     el("div", { class: "rec-list" }, recRows),
+    laterSounds.length ? el("div", { class: "actions" }, [
+      el("button", { class: "pbtn", text: showLaterSounds ? "Hide later sounds · 收起之后的发音" : `Show ${laterSounds.length} later sounds · 显示之后的 ${laterSounds.length} 个发音`,
+        onclick: () => { showLaterSounds = !showLaterSounds; renderParent(); } }),
+      el("span", { class: "word-list", text: "Each sound appears above when its letter is next · 快学到时会自动出现在上面" })
+    ]) : null,
+    showLaterSounds && laterSounds.length ? el("div", { class: "rec-list later" }, laterSounds.map(recRow)) : null,
     ...wordSection,
 
     el("h3", {}, bi("Voice", "声音")),
@@ -1064,8 +1161,7 @@ function importProgress(e) {
     try {
       const s = JSON.parse(reader.result);
       if (!s || s.version !== 1 || typeof s.introduced !== "number") throw new Error("bad file");
-      state = Object.assign(defaultState(), s);
-      state.introduced = Math.min(Math.max(1, state.introduced), LETTERS.length);
+      state = normalizeState(s);
       saveState();
       panelMessage = "Progress imported ✓ · 进度已导入";
     } catch (err) {

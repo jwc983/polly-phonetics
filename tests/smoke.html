@@ -46,7 +46,7 @@ async function playSession() {
   await loaded();
   frame.contentWindow.localStorage.clear();
   const results = [];
-  for (const introduced of [1, 6, 12]) {
+  for (const introduced of [1, 6, 12, 16, 31, 50]) {
     const w = frame.contentWindow;
     const st = JSON.parse(w.localStorage.getItem("polly-phonics-v1") || "null") || { version: 1 };
     st.introduced = introduced;
@@ -77,11 +77,14 @@ async function playSession() {
     computerSaid: spoken.slice(spokenBefore)
   };
   const state = JSON.parse(w.localStorage.getItem("polly-phonics-v1"));
+  const normalized = w.eval(`normalizeState({ version: 1, introduced: 999, stickers: -4, sessions: "bad", settings: { rounds: 99, voice: "robot", raiseMyPitch: 1 }, stats: { s: "bad" } })`);
   document.getElementById("report").textContent = "REPORT " + JSON.stringify({
     results, errors, seen: [...seen], stickers: state.stickers,
     lettersTried: Object.keys(state.stats).join(""), words: Object.keys(state.words).length,
     panelOk: panelText.includes("Grown-up menu") && panelText.includes("Record the letter sounds") && panelText.includes("Record words and phrases"), wordRecording, wordChips: d.querySelectorAll(".wchip").length,
-    recRows: d.querySelectorAll(".rec").length, spokenCount: spoken.length, robot: spoken.includes("Robot says"), robotReady: w.eval("robotReady().length"), turn: state.warmupTurn, seenRobot: seen.has("robot-game"), spokenSample: spoken.slice(0, 15)
+    recRows: d.querySelectorAll(".rec").length, spokenCount: spoken.length, robot: spoken.includes("Robot says"), robotReady: w.eval("robotReady().length"), turn: state.warmupTurn, seenRobot: seen.has("robot-game"),
+    normalizedState: { introduced: normalized.introduced, stickers: normalized.stickers, sessions: normalized.sessions.length, rounds: normalized.settings.rounds, voice: normalized.settings.voice, stats: Object.keys(normalized.stats).length },
+    spokenSample: spoken.slice(0, 15)
   });
 })();
 </script>
