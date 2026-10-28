@@ -73,8 +73,15 @@ Recordings stay in this browser on this computer: another browser (Chrome, Edge,
 with none. Alternatively, put audio files named after each sound — `s.m4a`, `a.m4a`, … `ch.m4a`,
 `igh.m4a`, and `oo2.m4a` for the oo in “book” (also `.mp3` or `.wav`) — in `audio/sounds/`;
 these work in every browser.
-Until a sound is recorded, the app says its picture word instead (“sun”), and the
-home screen shows a reminder.
+Until a sound is recorded, the app says the letter's picture word instead (“sun”, and
+“kite” for *k*), and the home screen shows a reminder. That only works when the word starts
+with the sound, so until they are recorded:
+
+- letters whose picture word does not start with their sound (*ck* “lock”, *ng* “ring”, *x* “box”,
+  and the vowel pairs) are shown on the “meet” screen but get no letter rounds;
+- reading words wait until every sound in them is recorded, because “sun, apple, tiger” cannot be
+  blended into “sat”. The grown-up menu says how many words are waiting;
+- robot talk waits too.
 
 ## Record everything in your own voice (optional)
 
@@ -145,9 +152,12 @@ Reading words is a bonus at this age, not a goal. Stop as soon as your child los
 
 ## Saving progress
 
-Progress is saved in the browser automatically. Use **Export** in the grown-up menu now and then
-to keep a backup file, and **Import** to restore it (for example, on another computer).
-Recordings are not included in the export.
+Progress is saved in the browser automatically. Use **Export progress** in the grown-up menu now and then
+to keep a backup file, and **Import progress** to restore it (for example, on another computer).
+Recordings are saved separately: **Export recordings** downloads one `.zip` file with all of them,
+and **Import recordings** puts them back (in any browser). Do this once you have recorded the
+sounds, so an hour of recording is not lost if the browser's data is cleared. The `sounds` folder
+inside the zip can also be copied to `audio/sounds/`.
 
 ## Files
 
@@ -165,8 +175,9 @@ To change the content (more words, other pictures), edit `data/curriculum.js`.
 ## Tests
 
 ```sh
-./tests/run-smoke.sh                  # plays 6 whole sessions in headless Chrome; prints a JSON report
+./tests/run-smoke.sh                  # plays 8 whole sessions in headless Chrome, checks the lesson rules,
+                                      # recordings backup and silence trimming; prints a JSON report
 node tests/screenshots.mjs /tmp/shots # saves a screenshot of each screen (needs Node 22+)
 ```
 
-A good smoke result shows every session ending at `"home"` and `"errors": []`.
+The script ends with `Smoke OK`, or lists what failed and exits with an error.

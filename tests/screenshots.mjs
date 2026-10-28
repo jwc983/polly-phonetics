@@ -57,6 +57,7 @@ await shot("letter-oo", 900, 760, run(`state.introduced = LETTERS.length; STEPS.
 await shot("parent", 900, 1400, `openParent(); true`);
 await shot("parent-all", 900, 1400, `state.introduced = LETTERS.length; openParent(); true`);
 await shot("parent-words", 900, 1100, `recordings["w:sun"] = recordings["p:starts"] = "x"; openParent(); document.getElementById("parent").scrollTop = document.querySelector(".word-grid").offsetTop - 260; true`);
+await shot("parent-backup", 900, 900, `state.introduced = 6; recordings["s"] = recordings["w:sun"] = "x"; openParent(); const h = [...document.querySelectorAll("#panel h3")].find((e) => e.textContent.startsWith("Save progress")); document.getElementById("parent").scrollTop = h.offsetTop - 380; true`);
 await shot("phone-sound", 390, 800, run(`STEPS.findSound({ letter: LETTERS[3] }, runId)`));
 await shot("phone-read", 390, 800, run(`STEPS.read({ word: C.readWords.find((w) => w.word === "map") }, runId)`));
 await shot("phone-read-ck", 390, 800, run(`STEPS.read({ word: C.readWords.find((w) => w.word === "kick") }, runId)`));

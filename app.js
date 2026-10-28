@@ -275,13 +275,25 @@ function playUrl(url) {
     a.play().catch(done);
   });
 }
-// Without a recording, say the keyword ("sun") instead. A computer voice saying
+// Without a recording, say a picture word ("sun") instead. A computer voice saying
 // an isolated sound adds "uh" (s → "suh"), which makes blending harder later.
-async function playPhoneme(ph) {
+// Pass the letter's own keyword so k says "kite" next to the kite, not "cat".
+async function playPhoneme(ph, word = C.phonemes[ph].keyword) {
   const url = soundUrl(ph);
   if (url) return playUrl(url);
-  return sayWord(C.phonemes[ph].keyword);
+  return sayWord(word);
 }
+// That stand-in only works when the word starts with the sound: k → "kite" does, ng → "ring" does not.
+const keywordStarts = (l) => C.pictures.some((p) => p.word === l.keyword && p.first === l.phoneme);
+const canHear = (l) => hasSound(l.phoneme) || keywordStarts(l);
+// Pictures that start with the letter's sound. Without a recording the prompt says the
+// letter's keyword, so that picture cannot be the answer: it would give it away.
+function soundTargets(letter) {
+  const all = C.pictures.filter((p) => p.first === letter.phoneme);
+  return hasSound(letter.phoneme) ? all : all.filter((p) => p.word !== letter.keyword);
+}
+// Reading needs every letter's real sound: picture words ("sun, apple, tiger") cannot be blended.
+const canBlend = (w) => lettersOf(w).every((l) => hasSound(l.phoneme));
 
 // Words and phrases: the grown-up's recording if there is one, otherwise the computer voice.
 const PHRASES = {
@@ -360,9 +372,123 @@ async function loadRecordings() {
 }
 // Keys: a phoneme ("s"), a word ("w:sun") or a phrase ("p:welldone").
 async function saveRecording(key, blob) {
+  keepStorage();
   try { await dbDo("readwrite", (s) => s.put(blob, key)); } catch (e) { /* kept for this visit only */ }
   if (recordings[key]) URL.revokeObjectURL(recordings[key]);
   recordings[key] = URL.createObjectURL(blob);
+}
+// Ask the browser not to clear recordings when the disk is short of space.
+let storageKept = false;
+function keepStorage() {
+  if (storageKept || !navigator.storage || !navigator.storage.persist) return;
+  storageKept = true;
+  navigator.storage.persist().catch(() => {});
+}
+
+// ---------- recordings backup: one .zip file ----------
+// Paths inside the zip: sounds/s.wav, words/sun.wav, phrases/welldone.wav. The sounds/
+// folder can also be copied to audio/sounds/ to use the letter sounds in another browser.
+const AUDIO_TYPES = { wav: "audio/wav", webm: "audio/webm", m4a: "audio/mp4", mp4: "audio/mp4", ogg: "audio/ogg", mp3: "audio/mpeg" };
+function recordingPath(key, type) {
+  const ext = Object.keys(AUDIO_TYPES).find((e) => type.startsWith(AUDIO_TYPES[e])) || "wav";
+  if (key.startsWith("w:")) return `words/${key.slice(2)}.${ext}`;
+  if (key.startsWith("p:")) return `phrases/${key.slice(2)}.${ext}`;
+  return `sounds/${key}.${ext}`;
+}
+function recordingKeyOf(path) {
+  const m = /^(?:.*\/)?(sounds|words|phrases)\/([^/]+)\.(\w+)$/.exec(path);
+  if (!m || !AUDIO_TYPES[m[3]]) return null;
+  if (m[1] === "sounds") return C.phonemes[m[2]] ? m[2] : null;
+  return (m[1] === "words" ? wordKey : phraseKey)(m[2]);
+}
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+function crc32(bytes) {
+  let c = 0xffffffff;
+  for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+// A zip with no compression (WAV hardly compresses anyway), which every computer can open.
+function makeZip(files) {
+  const parts = [], central = [];
+  let offset = 0;
+  for (const f of files) {
+    const name = new TextEncoder().encode(f.name);
+    const crc = crc32(f.bytes);
+    const head = (size, sig) => {
+      const v = new DataView(new ArrayBuffer(size));
+      v.setUint32(0, sig, true);
+      return v;
+    };
+    const local = head(30, 0x04034b50);
+    local.setUint16(4, 20, true); local.setUint16(6, 0x0800, true); // version 2.0, UTF-8 names
+    local.setUint16(12, 33, true); // 1 Jan 1980
+    local.setUint32(14, crc, true); local.setUint32(18, f.bytes.length, true); local.setUint32(22, f.bytes.length, true);
+    local.setUint16(26, name.length, true);
+    const cen = head(46, 0x02014b50);
+    cen.setUint16(4, 20, true); cen.setUint16(6, 20, true); cen.setUint16(8, 0x0800, true);
+    cen.setUint16(14, 33, true);
+    cen.setUint32(16, crc, true); cen.setUint32(20, f.bytes.length, true); cen.setUint32(24, f.bytes.length, true);
+    cen.setUint16(28, name.length, true); cen.setUint32(42, offset, true);
+    parts.push(local, name, f.bytes);
+    central.push(cen, name);
+    offset += 30 + name.length + f.bytes.length;
+  }
+  const size = central.reduce((sum, p) => sum + p.byteLength, 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true);
+  end.setUint16(8, files.length, true); end.setUint16(10, files.length, true);
+  end.setUint32(12, size, true); end.setUint32(16, offset, true);
+  return new Blob([...parts, ...central, end], { type: "application/zip" });
+}
+// Reads the uncompressed zips that makeZip writes.
+function readZip(buffer) {
+  const view = new DataView(buffer);
+  const out = [];
+  let p = 0;
+  while (p + 30 <= buffer.byteLength && view.getUint32(p, true) === 0x04034b50) {
+    if (view.getUint16(p + 8, true) !== 0 || view.getUint16(p + 6, true) & 8) throw new Error("compressed zip");
+    const size = view.getUint32(p + 18, true);
+    const nameLen = view.getUint16(p + 26, true);
+    const start = p + 30 + nameLen + view.getUint16(p + 28, true);
+    out.push({ name: new TextDecoder().decode(new Uint8Array(buffer, p + 30, nameLen)), bytes: new Uint8Array(buffer, start, size) });
+    p = start + size;
+  }
+  return out;
+}
+function recordingFiles() {
+  return Promise.all(Object.entries(recordings).map(async ([key, url]) => {
+    const blob = await (await fetch(url)).blob();
+    return { name: recordingPath(key, blob.type), bytes: new Uint8Array(await blob.arrayBuffer()) };
+  }));
+}
+async function exportRecordings() {
+  download(makeZip(await recordingFiles()), `polly-recordings-${today()}.zip`);
+}
+async function importRecordings(e) {
+  const file = e.target.files && e.target.files[0];
+  e.target.value = "";
+  if (!file) return;
+  let count = 0;
+  try {
+    for (const f of readZip(await file.arrayBuffer())) {
+      const key = recordingKeyOf(f.name);
+      if (!key) continue;
+      await saveRecording(key, new Blob([f.bytes], { type: AUDIO_TYPES[f.name.split(".").pop()] }));
+      count++;
+    }
+  } catch (err) { /* reported below */ }
+  panelMessage = count
+    ? `${count} recordings imported ✓ · 已导入 ${count} 个录音`
+    : "That file is not a Polly recordings file · 这不是 Polly 的录音文件";
+  renderParent();
 }
 async function deleteRecording(key) {
   try { await dbDo("readwrite", (s) => s.delete(key)); } catch (e) { /* nothing stored */ }
@@ -371,23 +497,43 @@ async function deleteRecording(key) {
 }
 
 // Trim silence from both ends so blended sounds follow each other closely.
+// Loudness is measured over 10 ms windows, not single samples, so a quiet hiss (s, f, th, h)
+// is kept whole. The first 80 ms are dropped: that is the click of the Record button.
 async function trimToWav(blob, thresholdRatio = 0.08) {
   const ctx = audioCtx();
   if (!ctx) return blob;
   try {
     const buf = await ctx.decodeAudioData(await blob.arrayBuffer());
     const data = buf.getChannelData(0);
+    const rate = buf.sampleRate;
+    const skip = Math.min(data.length, Math.floor(rate * 0.08));
+    const win = Math.max(1, Math.floor(rate * 0.01));
+    const levels = [];
+    for (let i = skip; i < data.length; i += win) {
+      const n = Math.min(win, data.length - i);
+      let sum = 0;
+      for (let j = 0; j < n; j++) sum += data[i + j] * data[i + j];
+      levels.push(Math.sqrt(sum / n));
+    }
+    const loudest = levels.reduce((a, b) => Math.max(a, b), 0);
+    if (loudest < 0.003) return blob;
+    const threshold = loudest * thresholdRatio;
+    const first = levels.findIndex((v) => v >= threshold);
+    let last = levels.length - 1;
+    while (last > first && levels[last] < threshold) last--;
+    const pad = Math.floor(rate * 0.03);
+    const start = Math.max(skip, skip + first * win - pad);
+    const end = Math.min(data.length, skip + (last + 1) * win + pad);
+    const samples = data.slice(start, end);
     let peak = 0;
-    for (let i = 0; i < data.length; i++) peak = Math.max(peak, Math.abs(data[i]));
-    if (peak < 0.01) return blob;
-    const threshold = peak * thresholdRatio;
-    let start = 0, end = data.length - 1;
-    while (start < end && Math.abs(data[start]) < threshold) start++;
-    while (end > start && Math.abs(data[end]) < threshold) end--;
-    const pad = Math.floor(buf.sampleRate * 0.03);
-    start = Math.max(0, start - pad);
-    end = Math.min(data.length - 1, end + pad);
-    return encodeWav(data.subarray(start, end + 1), buf.sampleRate, peak);
+    for (let i = 0; i < samples.length; i++) peak = Math.max(peak, Math.abs(samples[i]));
+    // 5 ms fades, so the cut ends do not click.
+    const fade = Math.min(Math.floor(rate * 0.005), Math.floor(samples.length / 2));
+    for (let i = 0; i < fade; i++) {
+      samples[i] *= i / fade;
+      samples[samples.length - 1 - i] *= i / fade;
+    }
+    return encodeWav(samples, rate, peak);
   } catch (e) {
     return blob;
   }
@@ -493,9 +639,10 @@ function buildPlan() {
     const target = pickTarget(last);
     last = target;
     // Letters with no "starts with" pictures (ck, ng, ai…) only get "hear the sound, tap the letter" rounds.
-    steps.push({ type: i % 2 === 0 || target.noPictures ? "findLetter" : "findSound", letter: target });
+    const pictures = !target.noPictures && soundTargets(target).length > 0;
+    steps.push({ type: i % 2 === 0 || !pictures ? "findLetter" : "findSound", letter: target });
   }
-  const words = readableWords();
+  const words = readableWords().filter(canBlend);
   if (words.length) {
     const tries = (w) => (state.words[w.word] || []).length;
     const newest = focusLetter();
@@ -507,11 +654,12 @@ function buildPlan() {
   return steps;
 }
 // Half the rounds practise the newest letter; the rest review earlier letters, weaker ones more often.
+// Only letters the child can actually hear: recorded, or with a keyword that starts with the sound (s is always one).
 function pickTarget(last) {
-  const known = introducedLetters();
+  const known = introducedLetters().filter(canHear);
   if (known.length === 1) return known[0];
   const focus = focusLetter();
-  if (last !== focus && Math.random() < 0.5) return focus;
+  if (canHear(focus) && last !== focus && Math.random() < 0.5) return focus;
   const pool = known.filter((l) => l !== last);
   const weights = pool.map((l) => {
     const s = letterStatus(l.id);
@@ -560,22 +708,23 @@ const STEPS = {
   // Meet today's letter: see it, hear its sound, link it to a keyword picture.
   async meet({ letter }, id) {
     const ph = letter.phoneme;
-    const letterBtn = el("button", { class: "hero-letter", text: letter.g, "aria-label": `Letter ${letter.g}`, onclick: () => { stopPrompt(); playPhoneme(ph); } });
+    const sound = () => playPhoneme(ph, letter.keyword);
+    const letterBtn = el("button", { class: "hero-letter", text: letter.g, "aria-label": `Letter ${letter.g}`, onclick: () => { stopPrompt(); sound(); } });
     const picBtn = el("button", { class: "hero-pic", text: letter.emoji, "aria-label": letter.keyword, onclick: () => { stopPrompt(); sayWord(letter.keyword); } });
     // Letters with the same sound (c, k and ck; f and ff) are shown together once they are taught.
     const twins = introducedLetters().filter((l) => l.phoneme === ph && l !== letter);
     const twinRow = twins.length
-      ? el("div", { class: "row" }, [...twins, letter].map((l) => el("button", { class: "choice letter", text: l.g, onclick: () => { stopPrompt(); playPhoneme(ph); } })))
+      ? el("div", { class: "row" }, [...twins, letter].map((l) => el("button", { class: "choice letter", text: l.g, onclick: () => { stopPrompt(); playPhoneme(ph, l.keyword); } })))
       : null;
     const slot = el("div");
     setKids(stage(), el("div", { class: "with-letter" }, [letterBtn, picBtn]), twinRow, slot);
     const sequence = async (check) => {
       letterBtn.classList.add("lit");
       try {
-        await playPhoneme(ph); check(); await sleep(450); check();
-        await playPhoneme(ph); check(); await sleep(350); check();
+        await sound(); check(); await sleep(450); check();
+        await sound(); check(); await sleep(350); check();
         await sayWord(letter.keyword); check(); await sleep(300); check();
-        await playPhoneme(ph); check();
+        await sound(); check();
       } finally {
         letterBtn.classList.remove("lit");
       }
@@ -602,7 +751,7 @@ const STEPS = {
     setKids(stage(), speaker, el("div", { class: "row" }, buttons));
     const prompt = async (check) => {
       speaker.classList.add("playing");
-      try { await playPhoneme(letter.phoneme); check(); } finally { speaker.classList.remove("playing"); }
+      try { await playPhoneme(letter.phoneme, letter.keyword); check(); } finally { speaker.classList.remove("playing"); }
     };
     replay = () => startPrompt(id, prompt);
     speaker.addEventListener("click", replay);
@@ -621,10 +770,7 @@ const STEPS = {
     const known = introducedLetters();
     const count = known.length <= 2 ? 2 : 3;
     const ph = letter.phoneme;
-    let targets = C.pictures.filter((p) => p.first === ph);
-    // With no recording the fallback says the keyword, which would give the answer away.
-    if (!hasSound(ph) && targets.length > 1) targets = targets.filter((p) => p.word !== C.phonemes[ph].keyword);
-    const target = pick(targets);
+    const target = pick(soundTargets(letter));
     const pool = C.pictures.filter((p) => p.first !== ph && !tooClose(ph, p.first));
     const options = shuffle([target, ...shuffle(pool).slice(0, count - 1)]);
     const buttons = options.map((p) => el("button", { class: "choice pic", text: p.emoji, "aria-label": p.word }));
@@ -634,7 +780,7 @@ const STEPS = {
       el("div", { class: "row" }, buttons));
     const sound = async (check) => {
       speaker.classList.add("playing");
-      try { await playPhoneme(ph); check(); } finally { speaker.classList.remove("playing"); }
+      try { await playPhoneme(ph, letter.keyword); check(); } finally { speaker.classList.remove("playing"); }
     };
     const prompt = async (check) => {
       await nameChoices(buttons, options.map((p) => p.word), check);
@@ -950,6 +1096,7 @@ function renderParent() {
   }
 
   const words = readableWords().map((w) => w.word);
+  const waitingWords = readableWords().filter((w) => !canBlend(w)).length;
 
   // Sounds for the letters taught so far and the next one come first; the rest are tucked away.
   const soon = new Set(LETTERS.slice(0, state.introduced + 1).map((l) => l.phoneme));
@@ -1024,6 +1171,8 @@ function renderParent() {
   youngBox.checked = !!state.settings.raiseMyPitch;
 
   const importInput = el("input", { type: "file", accept: "application/json,.json", hidden: "", onchange: importProgress });
+  const recordingsInput = el("input", { type: "file", accept: "application/zip,.zip", hidden: "", onchange: importRecordings });
+  const recordingCount = Object.keys(recordings).length;
 
   setKids(panel, 
     el("button", { class: "pbtn close", text: "✕ Close · 关闭", onclick: closeParent }),
@@ -1046,7 +1195,8 @@ function renderParent() {
     el("p", { class: "word-list" }, words.length
       ? `Words to read now (${words.length}) · 现在可以读的单词: ${words.join(", ")}`
       : "Reading words start after s, a, t · 学会 s、a、t 之后开始读单词"),
-    el("p", { class: "word-list", text: `Sessions finished · 已完成课程: ${state.sessions.length} · Today · 今天: ${state.sessions.filter((d) => d === today()).length}` }),
+    waitingWords ? el("p", { class: "word-list", text: `${waitingWords} of these come up in sessions once their letter sounds are recorded · 其中 ${waitingWords} 个单词要等录好字母发音后才会出现` }) : null,
+    el("p", { class: "word-list", text: `Sessions finished · 已完成课程: ${state.stickers} · Today · 今天: ${state.sessions.filter((d) => d === today()).length}` }),
 
     el("h3", {}, bi("Record the letter sounds", "录制字母发音")),
     el("p", {}, bi("Record each sound in your own voice, short and pure. Computer voices add “uh” (s → “suh”), which makes blending “s-a-t” into “sat” much harder. Recording stops by itself after 2.5 seconds; silence at the ends is trimmed.",
@@ -1080,12 +1230,19 @@ function renderParent() {
       "每次课程：1 分钟听力游戏、当前字母、字母练习，最多 2 个单词。孩子一没兴趣就停下来，随时点 🏠 结束。")),
 
     el("h3", {}, bi("Save progress", "保存进度")),
-    el("p", {}, bi("Progress is kept in this browser. Export a copy now and then (recordings are not included).",
-      "进度保存在这个浏览器里。请不时导出一份备份（录音不包含在内）。")),
+    el("p", {}, bi("Progress and recordings are kept in this browser only. Export a copy of each now and then.",
+      "进度和录音只保存在这个浏览器里。请不时分别导出一份备份。")),
     el("div", { class: "actions" }, [
-      el("button", { class: "pbtn", text: "⬇ Export · 导出", onclick: exportProgress }),
-      el("button", { class: "pbtn", text: "⬆ Import · 导入", onclick: () => importInput.click() }),
-      importInput,
+      el("button", { class: "pbtn", text: "⬇ Export progress · 导出进度", onclick: exportProgress }),
+      el("button", { class: "pbtn", text: "⬆ Import progress · 导入进度", onclick: () => importInput.click() }),
+      importInput
+    ]),
+    el("div", { class: "actions" }, [
+      el("button", { class: "pbtn", text: `⬇ Export ${recordingCount} recordings · 导出录音`, disabled: recordingCount ? null : "", onclick: exportRecordings }),
+      el("button", { class: "pbtn", text: "⬆ Import recordings · 导入录音", onclick: () => recordingsInput.click() }),
+      recordingsInput
+    ]),
+    el("div", { class: "actions" }, [
       el("button", { class: "pbtn danger", text: resetArmed ? "Tap again to erase all progress · 再点一次清除所有进度" : "Reset progress · 重置进度",
         onclick: () => {
           if (!resetArmed) { resetArmed = true; renderParent(); return; }
@@ -1114,7 +1271,8 @@ async function toggleRecording(key, maxMs = 2500) {
   }
   try {
     if (!micStream || !micStream.active) {
-      micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: false } });
+      // No noise suppression: it treats a long "sssss" or "ffff" as noise and removes it.
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
     }
   } catch (e) {
     panelMessage = "Microphone not available — please allow microphone access · 无法使用麦克风，请允许访问麦克风";
@@ -1146,15 +1304,18 @@ function stopRecording() {
   if (recorder && recorder.state !== "inactive") recorder.stop();
 }
 
-function exportProgress() {
-  const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
-  const a = el("a", { href: URL.createObjectURL(blob), download: `polly-progress-${today()}.json` });
+function download(blob, name) {
+  const a = el("a", { href: URL.createObjectURL(blob), download: name });
   document.body.append(a);
   a.click();
   setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
 }
+function exportProgress() {
+  download(new Blob([JSON.stringify(state, null, 2)], { type: "application/json" }), `polly-progress-${today()}.json`);
+}
 function importProgress(e) {
   const file = e.target.files && e.target.files[0];
+  e.target.value = "";
   if (!file) return;
   const reader = new FileReader();
   reader.onload = () => {
@@ -1177,5 +1338,6 @@ function importProgress(e) {
 (async function init() {
   goHome();
   await Promise.all([loadRecordings(), findSoundFiles()]);
+  if (Object.keys(recordings).length) keepStorage();
   goHome();
 })();

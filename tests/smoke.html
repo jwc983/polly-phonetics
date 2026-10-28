@@ -24,14 +24,23 @@ function hook() {
   return { w, d: frame.contentDocument };
 }
 
+// Pretends every letter sound is recorded (in memory only), as a short tone.
+const FAKE_SOUNDS = `{ const url = URL.createObjectURL(encodeWav(new Float32Array(2205).fill(0.2), 22050, 0.2));
+  Object.keys(CURRICULUM.phonemes).forEach((ph) => { recordings[ph] = url; }); }`;
+
 async function playSession() {
   const { d } = hook();
+  const run = { read: false, robot: false };
   d.getElementById("startBtn").click();
   for (let tick = 0; tick < 600; tick++) {
     await sleep(150);
-    if (!d.getElementById("home").hidden) return "home";
+    if (!d.getElementById("home").hidden) return { end: "home", ...run };
     const stage = d.getElementById("stage");
-    [...stage.querySelectorAll("button")].forEach((b) => { seen.add(b.className.split(" ")[0] || b.textContent); if (b.getAttribute("aria-label") === "Robot") seen.add("robot-game"); });
+    [...stage.querySelectorAll("button")].forEach((b) => {
+      seen.add(b.className.split(" ")[0] || b.textContent);
+      if (b.getAttribute("aria-label") === "Robot") { seen.add("robot-game"); run.robot = true; }
+      if (b.classList.contains("tile")) run.read = true;
+    });
     const next = stage.querySelector("button.next");
     if (next) { next.click(); continue; }
     const judge = stage.querySelector(".judge button");
@@ -39,14 +48,15 @@ async function playSession() {
     const choices = [...stage.querySelectorAll("button.choice:not(.faded):not(.right)")];
     if (choices.length) choices[tick % choices.length].click();
   }
-  return "timeout";
+  return { end: "timeout", ...run };
 }
 
 (async () => {
   await loaded();
   frame.contentWindow.localStorage.clear();
   const results = [];
-  for (const introduced of [1, 6, 12, 16, 31, 50]) {
+  const runs = [[1, false], [12, false], [31, false], [50, false], [6, true], [16, true], [31, true], [50, true]];
+  for (const [introduced, recorded] of runs) {
     const w = frame.contentWindow;
     const st = JSON.parse(w.localStorage.getItem("polly-phonics-v1") || "null") || { version: 1 };
     st.introduced = introduced;
@@ -54,8 +64,51 @@ async function playSession() {
     w.location.reload();
     await loaded();
     await sleep(2000); // let the app finish looking for sound files
-    results.push({ introduced, end: await playSession() });
+    if (recorded) frame.contentWindow.eval(FAKE_SOUNDS);
+    results.push({ introduced, recorded, ...(await playSession()) });
   }
+
+  // Lesson rules without recordings: every round must be one the child can hear.
+  frame.contentWindow.eval("Object.keys(recordings).forEach((k) => delete recordings[k])");
+  const rules = frame.contentWindow.eval(`(() => {
+    const saved = state.introduced, bad = [];
+    for (const n of [9, 12, 13, 23, 35, 50]) {
+      state.introduced = n;
+      for (let i = 0; i < 100; i++) for (const s of buildPlan()) {
+        if (s.type === "read") bad.push("read without sounds: " + s.word.word);
+        if ((s.type === "findLetter" || s.type === "findSound") && !keywordStarts(s.letter)) bad.push(s.type + " with unhearable " + s.letter.g);
+        if (s.type === "findSound" && s.letter.g === "i") bad.push("findSound for i gives the answer away");
+      }
+    }
+    state.introduced = saved;
+    return [...new Set(bad)];
+  })()`);
+
+  // Recordings backup: a zip round trip, and the standard CRC-32 check value.
+  const zip = await frame.contentWindow.eval(`(async () => {
+    const files = [["sounds/s.wav", [1, 2, 3]], ["words/yo-yo.wav", [4, 5]], ["phrases/welldone.webm", []]]
+      .map(([name, bytes]) => ({ name, bytes: new Uint8Array(bytes) }));
+    const back = readZip(await makeZip(files).arrayBuffer());
+    recordings["w:sun"] = URL.createObjectURL(encodeWav(new Float32Array(100), 22050, 0.2));
+    const exported = (await recordingFiles()).map((f) => f.name + ":" + f.bytes.length);
+    delete recordings["w:sun"];
+    return {
+      exported,
+      crc: crc32(new TextEncoder().encode("123456789")) === 0xcbf43926,
+      roundTrip: JSON.stringify(back.map((f) => [f.name, [...f.bytes]])) === JSON.stringify(files.map((f) => [f.name, [...f.bytes]])),
+      keys: back.map((f) => recordingKeyOf(f.name)).concat(recordingKeyOf("__MACOSX/x.txt"), recordingKeyOf("polly/sounds/oo2.wav"))
+    };
+  })()`);
+
+  // Trimming: a loud click, silence, then a quiet 0.4 s hiss. The hiss must be kept, the click dropped.
+  const trimmedSeconds = await frame.contentWindow.eval(`(async () => {
+    const rate = 22050, s = new Float32Array(Math.floor(rate * 1.05));
+    for (let i = 0; i < 40; i++) s[i] = 1;
+    for (let i = Math.floor(rate * 0.35); i < Math.floor(rate * 0.75); i++) s[i] = (Math.random() * 2 - 1) * 0.05;
+    const out = await trimToWav(encodeWav(s, rate, 1));
+    return (await audioCtx().decodeAudioData(await out.arrayBuffer())).duration;
+  })()`);
+
   const { w, d } = hook();
   w.openParent();
   await sleep(100);
@@ -70,6 +123,8 @@ async function playSession() {
   await w.eval(`sayWord("sun")`);
   await w.eval(`sayWord("moon")`);
   await w.eval(`sayPhraseThen("rhymes", "cat", () => {})`);
+  // Without a recording, k is heard as "kite" (its own picture), not "cat".
+  await w.eval(`playPhoneme("k", letterOf("k").keyword)`);
   w.Audio = RealAudio;
   const wordRecording = {
     items: w.eval(`recordableWords().length + Object.keys(PHRASES).length`),
@@ -79,10 +134,10 @@ async function playSession() {
   const state = JSON.parse(w.localStorage.getItem("polly-phonics-v1"));
   const normalized = w.eval(`normalizeState({ version: 1, introduced: 999, stickers: -4, sessions: "bad", settings: { rounds: 99, voice: "robot", raiseMyPitch: 1 }, stats: { s: "bad" } })`);
   document.getElementById("report").textContent = "REPORT " + JSON.stringify({
-    results, errors, seen: [...seen], stickers: state.stickers,
+    results, errors, rules, zip, trimmedSeconds, seen: [...seen], stickers: state.stickers,
     lettersTried: Object.keys(state.stats).join(""), words: Object.keys(state.words).length,
-    panelOk: panelText.includes("Grown-up menu") && panelText.includes("Record the letter sounds") && panelText.includes("Record words and phrases"), wordRecording, wordChips: d.querySelectorAll(".wchip").length,
-    recRows: d.querySelectorAll(".rec").length, spokenCount: spoken.length, robot: spoken.includes("Robot says"), robotReady: w.eval("robotReady().length"), turn: state.warmupTurn, seenRobot: seen.has("robot-game"),
+    panelOk: panelText.includes("Grown-up menu") && panelText.includes("Record the letter sounds") && panelText.includes("Record words and phrases") && panelText.includes("Import recordings"), wordRecording, wordChips: d.querySelectorAll(".wchip").length,
+    recRows: d.querySelectorAll(".rec").length, spokenCount: spoken.length, turn: state.warmupTurn, seenRobot: seen.has("robot-game"),
     normalizedState: { introduced: normalized.introduced, stickers: normalized.stickers, sessions: normalized.sessions.length, rounds: normalized.settings.rounds, voice: normalized.settings.voice, stats: Object.keys(normalized.stats).length },
     spokenSample: spoken.slice(0, 15)
   });
